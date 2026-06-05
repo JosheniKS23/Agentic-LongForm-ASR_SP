@@ -6,29 +6,36 @@ import matplotlib.pyplot as plt
 from jiwer import wer, wil, wip
 import torch
 import soundfile as sf
+import time
+import pandas as pd
+
+# ==============================
+# RESULTS FOLDER
+# ==============================
+RESULTS_FOLDER = "SP_results_final_V2"
+os.makedirs(RESULTS_FOLDER, exist_ok=True)
+print(f"Results will be saved in: {RESULTS_FOLDER}")
 
 # ==============================
 # DEVICE
 # ==============================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("Using device:", device)
+print("CUDA Available:", torch.cuda.is_available())
+print("GPU Name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "No GPU")
 
 # ==============================
 # CONFIG
 # ==============================
-FOLDER = r"C:\Users\joshe\OneDrive - Amrita vishwa vidyapeetham\_collegefiles\SEM_files_\Sem_4\SP\project_endsem\amicorpus\IS1000a\audio"
 
-BASE_CHUNK = 15
-SMALL_CHUNK = 5
-LARGE_CHUNK = 25
+BASE_CHUNK = 45
+SMALL_CHUNK = 20
+LARGE_CHUNK = 60
 
 LOW_CONF = -1.0
 HIGH_CONF = -0.6
 
-# Add reference manually if available
-REFERENCE_TEXTS = {
-    # "IS1000a.Headset-0.wav": "your reference text here"
-}
+REFERENCE_TEXTS = {}
 
 # ==============================
 # LOAD MODELS
@@ -40,68 +47,201 @@ base_model = whisper.load_model("base").to(device)
 # ==============================
 # AGENT CONTROLLER
 # ==============================
-class AgentController:
+class Agent:
     def __init__(self):
-        self.prev_conf = None
+        self.history = []
+        self.prev_text = ""
+        self.redecode_count = 0
+        self.total_chunks = 0
+        self.total_redecodes = 0
+        self.start_time = time.time()
 
-    def decide_chunk_size(self):
-        if self.prev_conf is None:
-            return BASE_CHUNK
-        if self.prev_conf < LOW_CONF:
-            return SMALL_CHUNK
-        elif self.prev_conf > HIGH_CONF:
-            return LARGE_CHUNK
-        return BASE_CHUNK
+        self.chunk_stats = {
+            SMALL_CHUNK: 0,
+            BASE_CHUNK: 0,
+            LARGE_CHUNK: 0
+        }
 
-    def decide_model(self):
-        if self.prev_conf is None:
-            return "both"
-        if self.prev_conf > HIGH_CONF:
+        self.model_usage = {
+            "tiny": 0,
+            "base": 0
+        }
+
+    def avg_conf(self):
+        if not self.history:
+            return -1.0
+        return sum(self.history) / len(self.history)
+
+    def audio_difficulty(self, chunk, sr):
+
+        rms = np.mean(
+            librosa.feature.rms(y=chunk)
+        )
+
+        silence_ratio = np.mean(
+            np.abs(chunk) < 0.005
+        )
+
+        difficulty_score = 0
+
+        # Very weak speech
+        if rms < 0.015:
+            difficulty_score += 1
+
+        # Excessive silence
+        if silence_ratio > 0.70:
+            difficulty_score += 1
+
+        return difficulty_score
+
+    def decide_chunk(self, chunk=None, sr=None):
+
+        avg = self.avg_conf()
+        difficulty = 0
+
+        if chunk is not None:
+            difficulty = self.audio_difficulty(
+                chunk,
+                sr
+            )
+
+        # Hard audio
+        if avg < -1.4 and difficulty >= 1:
+            chunk_size = SMALL_CHUNK
+
+        # Easy audio
+        elif avg > -0.5 and difficulty == 0:
+            chunk_size = LARGE_CHUNK
+
+        else:
+            chunk_size = BASE_CHUNK
+
+        self.chunk_stats[chunk_size] += 1
+
+        return chunk_size
+
+    def decide_model(self, chunk=None, sr=None):
+
+        avg = self.avg_conf()
+
+        difficulty = 0
+
+        budget_mode = self.compute_budget_mode()
+
+        if chunk is not None:
+            difficulty = self.audio_difficulty(
+                chunk,
+                sr
+            )
+
+        # Compute-saving mode
+        if budget_mode:
+
+            if avg < -1.5 and difficulty >= 1:
+                self.model_usage["base"] += 1
+                return "base"
+
+            self.model_usage["tiny"] += 1
             return "tiny"
-        return "both"
+
+        # Easy chunk
+        if avg > -0.7 and difficulty == 0:
+            self.model_usage["tiny"] += 1
+            return "tiny"
+
+        # Hard chunk
+        self.model_usage["base"] += 1
+        return "base"
 
     def need_redecode(self, conf):
-        return conf < LOW_CONF
+        if self.redecode_count > 5:
+            return False
+        if conf < LOW_CONF:
+            self.redecode_count += 1
+            self.total_redecodes += 1
+            return True
+        return False
 
-    def update(self, conf):
-        self.prev_conf = conf
+    def get_context(self):
 
-# ==============================
-# SIMPLE SPEAKER SPLIT
-# ==============================
-def simple_speaker_split(text):
-    sentences = text.split(".")
-    result = []
-    speaker = 0
+        avg = self.avg_conf()
 
-    for s in sentences:
-        if s.strip():
-            result.append(f"SPEAKER_{speaker}: {s.strip()}")
-            speaker = 1 - speaker
+        # High confidence → larger context
+        if avg > -0.5:
+            context_size = 250
 
-    return result
+        # Low confidence → shorter context
+        elif avg < -1:
+            context_size = 80
 
-# ==============================
-# SPLIT AUDIO
-# ==============================
-def split_audio(audio, sr, duration):
-    size = int(duration * sr)
-    return [audio[i:i+size] for i in range(0, len(audio), size)]
+        else:
+            context_size = 150
+
+        return self.prev_text[-context_size:]
+
+    def update(self, conf, text):
+        self.history.append(conf)
+        if len(self.history) > 5:
+            self.history.pop(0)
+        self.prev_text += " " + text
+        self.total_chunks += 1
+
+    # ==============================
+    # COMPUTE BUDGET AGENT
+    # ==============================
+    def compute_budget_mode(self):
+
+        runtime = time.time() - self.start_time
+
+        # Runtime budget exceeded
+        if runtime > 120:
+            return True
+
+        return False
+
+    def compute_metrics(self):
+        runtime = time.time() - self.start_time
+        return {
+            "chunks": self.total_chunks,
+            "redecodes": self.total_redecodes,
+            "runtime": runtime,
+            "redecode_ratio": self.total_redecodes / max(self.total_chunks,1),
+            "tiny_ratio": self.model_usage["tiny"] /
+                          max(self.total_chunks, 1),
+
+            "base_ratio": self.model_usage["base"] /
+                          max(self.total_chunks, 1)
+        }
 
 # ==============================
 # ASR AGENT
 # ==============================
-def asr_agent(chunk, sr, mode):
+def asr_agent(chunk, sr, mode, context):
+
     sf.write("temp.wav", chunk, sr)
 
     if mode == "tiny":
-        return [tiny_model.transcribe("temp.wav", fp16=(device=="cuda"))]
-    else:
+
         return [
-            tiny_model.transcribe("temp.wav", fp16=False),
-            base_model.transcribe("temp.wav", fp16=(device=="cuda"))
+            tiny_model.transcribe(
+                "temp.wav",
+                initial_prompt=context,
+                fp16=(device == "cuda")
+            )
         ]
 
+    elif mode == "base":
+
+        return [
+            base_model.transcribe(
+                "temp.wav",
+                initial_prompt=context,
+                fp16=(device == "cuda")
+            )
+        ]
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
 # ==============================
 # CONFIDENCE
 # ==============================
@@ -110,126 +250,340 @@ def get_conf(res):
         return np.mean([s["avg_logprob"] for s in res["segments"]])
     return -2.0
 
-# ==============================
-# MODEL SELECTION
-# ==============================
-def selection_agent(results):
-    best_text = ""
-    best_conf = -2.0
-
+def select_best(results):
+    best_text, best_conf = "", -2.0
     for r in results:
         c = get_conf(r)
         if c > best_conf:
             best_conf = c
             best_text = r["text"]
-
     return best_text, best_conf
-
-# ==============================
-# METRICS
-# ==============================
-def evaluate(file, pred_text):
-    if file not in REFERENCE_TEXTS:
-        print("No reference → skipping metrics")
-        return
-
-    ref = REFERENCE_TEXTS[file]
-
-    print("\n📊 METRICS:")
-    print("WER:", wer(ref, pred_text))
-    print("WIL:", wil(ref, pred_text))
-    print("WIP:", wip(ref, pred_text))
 
 # ==============================
 # PROCESS FILE
 # ==============================
 def process_file(file):
     print(f"\nProcessing: {file}")
+    audio_type = "Headset" if "Headset" in file else "Array"
 
-    agent = AgentController()
-    path = os.path.join(FOLDER, file)
-
+    agent = Agent()
+    path = file
+    file = os.path.basename(file)
     audio, sr = librosa.load(path, sr=16000, mono=True)
 
     pointer = 0
     final_text = ""
     confidences = []
+    model_history = []
+    chunk_history = []
 
     while pointer < len(audio):
 
-        chunk_size = agent.decide_chunk_size()
-        chunk_len = int(chunk_size * sr)
+        preview = audio[
+                  pointer:pointer + int(BASE_CHUNK * sr)
+                  ]
 
+        chunk_size = agent.decide_chunk(
+            preview,
+            sr
+        )
+        chunk_len = int(chunk_size * sr)
         chunk = audio[pointer:pointer+chunk_len]
 
         if len(chunk) < sr:
             break
 
-        print(f"\nChunk @ {pointer/sr:.2f}s | size={chunk_size}s")
+        context = agent.get_context()
+        mode = agent.decide_model(
+            chunk,
+            sr
+        )
 
-        mode = agent.decide_model()
-        results = asr_agent(chunk, sr, mode)
+        results = asr_agent(chunk, sr, mode, context)
+        text, conf = select_best(results)
+        # ==============================
+        # DECISION LOGGING
+        # ==============================
+        redecode_flag = agent.need_redecode(conf)
 
-        text, conf = selection_agent(results)
+        print(
+            f"\n--------------------------------\n"
+            f"Chunk Number : {agent.total_chunks + 1}\n"
+            f"Confidence   : {round(conf, 3)}\n"
+            f"Chunk Size   : {chunk_size}s\n"
+            f"Selected Model : {mode}\n"
+            f"Re-decode Triggered : {redecode_flag}\n"
+            f"--------------------------------"
+        )
 
-        print(f"   Mode: {mode} | Conf: {conf:.2f}")
-
-        if agent.need_redecode(conf):
-            print("   🔁 Re-decoding...")
-            subs = split_audio(chunk, sr, SMALL_CHUNK)
+        if redecode_flag:
+            subs = [chunk[i:i+int(SMALL_CHUNK*sr)] for i in range(0, len(chunk), int(SMALL_CHUNK*sr))]
             texts = []
-
-            for sub in subs:
-                sub_res = asr_agent(sub, sr, "both")
-                t, _ = selection_agent(sub_res)
+            for s in subs:
+                sub_res = asr_agent(s, sr, "base", context)
+                t, _ = select_best(sub_res)
                 texts.append(t)
-
             text = " ".join(texts)
 
-        agent.update(conf)
+        agent.update(conf, text)
+
         final_text += text + " "
         confidences.append(conf)
+        model_history.append(mode)
+        chunk_history.append(chunk_size)
 
         pointer += chunk_len
 
     # ==============================
-    # SAVE TEXT
+    # SAVE OUTPUT
     # ==============================
-    with open(f"{file}_output.txt", "w", encoding="utf-8") as f:
+    output_path = os.path.join(
+        RESULTS_FOLDER,
+        f"{file}_output.txt"
+    )
+
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write(final_text)
-
-    # ==============================
-    # SPEAKER OUTPUT
-    # ==============================
-    speaker_lines = simple_speaker_split(final_text)
-
-    with open(f"{file}_speaker.txt", "w", encoding="utf-8") as f:
-        for line in speaker_lines:
-            f.write(line + "\n")
 
     # ==============================
     # GRAPH
     # ==============================
+    plt.figure()
     plt.plot(confidences)
     plt.title(file)
     plt.xlabel("Chunks")
     plt.ylabel("Confidence")
-    plt.savefig(f"{file}_graph.png")
+    plt.savefig(
+        os.path.join(
+            RESULTS_FOLDER,
+            f"{file}_graph.png"
+        )
+    )
     plt.close()
 
     # ==============================
-    # METRICS
+    # DECISION TIMELINE GRAPH
     # ==============================
-    evaluate(file, final_text)
+    plt.figure(figsize=(10, 5))
 
-    return final_text
+    x = range(len(confidences))
+
+    plt.plot(x, confidences, label="Confidence")
+
+    for i in range(len(model_history)):
+        if model_history[i] == "tiny":
+            plt.scatter(i, confidences[i], marker='o', label="Tiny" if i == 0 else "")
+        else:
+            plt.scatter(i, confidences[i], marker='x', label="Base" if i == 0 else "")
+
+    plt.xlabel("Chunk Number")
+    plt.ylabel("Confidence")
+    plt.title(f"{file} Decision Timeline")
+    plt.legend()
+    plt.savefig(
+        os.path.join(
+            RESULTS_FOLDER,
+            f"{file}_timeline.png"
+        )
+    )
+    plt.close()
+
+    metrics = agent.compute_metrics()
+    metrics["small_chunks"] = agent.chunk_stats[SMALL_CHUNK]
+    metrics["base_chunks"] = agent.chunk_stats[BASE_CHUNK]
+    metrics["large_chunks"] = agent.chunk_stats[LARGE_CHUNK]
+    metrics["tiny_usage"] = agent.model_usage["tiny"]
+    metrics["base_usage"] = agent.model_usage["base"]
+    metrics["audio_type"] = audio_type
+    metrics["tiny_selected"] = agent.model_usage["tiny"]
+    metrics["base_selected"] = agent.model_usage["base"]
+    metrics["small_chunk_used"] = agent.chunk_stats[SMALL_CHUNK]
+    metrics["base_chunk_used"] = agent.chunk_stats[BASE_CHUNK]
+    metrics["large_chunk_used"] = agent.chunk_stats[LARGE_CHUNK]
+
+
+    # ==============================
+    # CONFIDENCE HEATMAP
+    # ==============================
+    plt.figure(figsize=(10, 2))
+    heat = np.array(confidences).reshape(1, -1)
+    plt.imshow(
+        heat,
+        aspect='auto',
+        cmap='coolwarm'
+    )
+    plt.colorbar(label="Confidence")
+    plt.yticks([])
+    plt.xlabel("Chunks")
+    plt.title(f"{file} Confidence Heatmap")
+    plt.savefig(
+        os.path.join(
+            RESULTS_FOLDER,
+            f"{file}_heatmap.png"
+        )
+    )
+    plt.close()
+    return metrics
 
 # ==============================
 # MAIN
 # ==============================
-files = [f for f in os.listdir(FOLDER) if f.endswith(".wav")]
 
-for f in files[:2]:   # change later to full dataset
-    process_file(f)
+TEST_FOLDER = r"C:\Users\joshe\OneDrive - Amrita vishwa vidyapeetham\_collegefiles\SEM_files_\Sem_4\SP\project_endsem\amicorpus\test_cases"
 
-print("\n✅ ALL DONE")
+files = [
+    os.path.join(TEST_FOLDER, f)
+    for f in os.listdir(TEST_FOLDER)
+    if f.endswith(".wav")
+]
+
+print("\nSelected Files:")
+for f in files:
+    print(os.path.basename(f))
+
+all_results = []
+
+for f in files:
+    try:
+        res = process_file(f)
+        res["file"] = os.path.basename(f)
+        all_results.append(res)
+
+    except Exception as e:
+        print("ERROR:", f)
+        print(e)
+
+# ==============================
+# TABLE OUTPUT
+# ==============================
+df = pd.DataFrame(all_results)
+df.to_csv(
+    os.path.join(
+        RESULTS_FOLDER,
+        "agent_results.csv"
+    ),
+    index=False
+)
+
+# ==============================
+# AGENT DECISION SUMMARY TABLE
+# ==============================
+summary = pd.DataFrame({
+    "Metric": [
+        "Tiny Selected",
+        "Base Selected",
+        "Small Chunks",
+        "Base Chunks",
+        "Large Chunks"
+    ],
+    "Count": [
+        df["tiny_selected"].sum(),
+        df["base_selected"].sum(),
+        df["small_chunk_used"].sum(),
+        df["base_chunk_used"].sum(),
+        df["large_chunk_used"].sum()
+    ]
+})
+
+summary.to_csv(
+    os.path.join(
+        RESULTS_FOLDER,
+        "agent_decision_summary.csv"
+    ),
+    index=False
+)
+
+print("\n📊 Agent Decision Summary")
+print(summary)
+
+print("\n📊 Agent-wise Results Table:")
+print(df)
+
+# ==============================
+# OVERALL METRICS
+# ==============================
+overall = {
+    "avg_runtime": df["runtime"].mean(),
+    "avg_chunks": df["chunks"].mean(),
+    "avg_redecodes": df["redecodes"].mean(),
+    "avg_redecode_ratio": df["redecode_ratio"].mean()
+}
+
+print("\n📊 Overall Performance:")
+for k, v in overall.items():
+    print(k, ":", round(v, 3))
+
+# ==============================
+# COMPARISON GRAPH
+# ==============================
+plt.figure()
+plt.bar(df["file"], df["runtime"])
+plt.xticks(rotation=45)
+plt.title("Runtime Comparison")
+plt.savefig(
+    os.path.join(
+        RESULTS_FOLDER,
+        "runtime_comparison.png"
+    )
+)
+plt.close()
+
+plt.figure()
+plt.bar(df["file"], df["redecode_ratio"])
+plt.xticks(rotation=45)
+plt.title("Re-decode Ratio Comparison")
+plt.savefig(
+    os.path.join(
+        RESULTS_FOLDER,
+        "redecode_comparison.png"
+    )
+)
+plt.close()
+
+plt.figure()
+grouped = df.groupby("audio_type")["runtime"].mean()
+plt.bar(grouped.index, grouped.values)
+plt.title("Headset vs Array Runtime")
+plt.ylabel("Average Runtime")
+plt.savefig(
+    os.path.join(
+        RESULTS_FOLDER,
+        "headset_vs_array_runtime.png"
+    )
+)
+plt.close()
+
+chunk_totals = {
+    "Small": df["small_chunks"].sum(),
+    "Base": df["base_chunks"].sum(),
+    "Large": df["large_chunks"].sum()
+}
+plt.figure()
+plt.bar(chunk_totals.keys(), chunk_totals.values())
+plt.title("Chunk Distribution")
+plt.ylabel("Count")
+plt.savefig(
+    os.path.join(
+        RESULTS_FOLDER,
+        "chunk_distribution.png"
+    )
+)
+plt.close()
+
+model_totals = {
+    "Tiny": df["tiny_usage"].sum(),
+    "Base": df["base_usage"].sum()
+}
+plt.figure()
+plt.bar(model_totals.keys(), model_totals.values())
+plt.title("Tiny vs Base Model Usage")
+plt.ylabel("Usage Count")
+plt.savefig(
+    os.path.join(
+        RESULTS_FOLDER,
+        "model_usage.png"
+    )
+)
+plt.close()
+
+print("\n✅ EVERYTHING COMPLETE")
