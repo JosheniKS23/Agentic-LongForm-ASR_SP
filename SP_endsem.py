@@ -7,6 +7,7 @@ import torch
 import soundfile as sf
 import time
 import pandas as pd
+import traceback
 
 # ==============================
 # RESULTS FOLDER
@@ -239,7 +240,6 @@ def asr_agent(chunk, sr, mode, context):
     sf.write("temp.wav", chunk, sr)
 
     if mode == "tiny":
-
         return [
             tiny_model.transcribe(
                 "temp.wav",
@@ -249,7 +249,6 @@ def asr_agent(chunk, sr, mode, context):
         ]
 
     elif mode == "base":
-
         return [
             base_model.transcribe(
                 "temp.wav",
@@ -257,9 +256,6 @@ def asr_agent(chunk, sr, mode, context):
                 fp16=(device == "cuda")
             )
         ]
-
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
 # ==============================
 # CONFIDENCE
 # ==============================
@@ -317,7 +313,7 @@ def process_file(file):
             chunk,
             sr
         )
-
+        print("Running model:", mode)
         results = asr_agent(chunk, sr, mode, context)
         text, conf = select_best(results)
         # ==============================
@@ -512,12 +508,17 @@ for f in files:
         all_results.append(res)
 
     except Exception as e:
+
         print("ERROR:", f)
-        print(e)
+
+        traceback.print_exc()
 
 # ==============================
 # TABLE OUTPUT
 # ==============================
+if len(all_results) == 0:
+    print("No files processed successfully.")
+    exit()
 df = pd.DataFrame(all_results)
 df.to_csv(
     os.path.join(
