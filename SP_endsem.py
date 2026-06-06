@@ -55,6 +55,7 @@ class Agent:
         self.total_chunks = 0
         self.total_redecodes = 0
         self.start_time = time.time()
+        self.low_conf_streak = 0
 
         self.chunk_stats = {
             SMALL_CHUNK: 0,
@@ -187,6 +188,24 @@ class Agent:
         self.total_chunks += 1
 
     # ==============================
+    # CONTEXT REFRESH AGENT
+    # ==============================
+    def refresh_context(self, conf):
+
+        if conf < -1.3:
+            self.low_conf_streak += 1
+        else:
+            self.low_conf_streak = 0
+
+        # Two consecutive bad chunks
+        if self.low_conf_streak >= 2:
+            print("⚠ Context Refreshed")
+
+            self.prev_text = ""
+
+            self.low_conf_streak = 0
+
+    # ==============================
     # COMPUTE BUDGET AGENT
     # ==============================
     def compute_budget_mode(self):
@@ -276,6 +295,7 @@ def process_file(file):
     confidences = []
     model_history = []
     chunk_history = []
+    confidence_gains = []
 
     while pointer < len(audio):
 
@@ -317,20 +337,53 @@ def process_file(file):
         )
 
         if redecode_flag:
-            subs = [chunk[i:i+int(SMALL_CHUNK*sr)] for i in range(0, len(chunk), int(SMALL_CHUNK*sr))]
+
+            before_conf = conf
+
+            subs = [
+                chunk[i:i + int(SMALL_CHUNK * sr)]
+                for i in range(
+                    0,
+                    len(chunk),
+                    int(SMALL_CHUNK * sr)
+                )
+            ]
+
             texts = []
+            sub_confs = []
+
             for s in subs:
-                sub_res = asr_agent(s, sr, "base", context)
-                t, _ = select_best(sub_res)
+                sub_res = asr_agent(
+                    s,
+                    sr,
+                    "base",
+                    context
+                )
+
+                t, c = select_best(sub_res)
+
                 texts.append(t)
+                sub_confs.append(c)
+
             text = " ".join(texts)
 
-        agent.update(conf, text)
+            after_conf = np.mean(sub_confs)
 
-        final_text += text + " "
+            confidence_gains.append(
+                after_conf - before_conf
+            )
+
+            conf = after_conf
         confidences.append(conf)
+
         model_history.append(mode)
+
         chunk_history.append(chunk_size)
+
+        final_text += " " + text
+
+        agent.refresh_context(conf)
+        agent.update(conf, text)
 
         pointer += chunk_len
 
@@ -400,6 +453,11 @@ def process_file(file):
     metrics["small_chunk_used"] = agent.chunk_stats[SMALL_CHUNK]
     metrics["base_chunk_used"] = agent.chunk_stats[BASE_CHUNK]
     metrics["large_chunk_used"] = agent.chunk_stats[LARGE_CHUNK]
+    metrics["avg_confidence"] = (
+        np.mean(confidences)
+        if len(confidences) > 0
+        else 0
+    )
 
 
     # ==============================
@@ -423,6 +481,11 @@ def process_file(file):
         )
     )
     plt.close()
+    metrics["avg_conf_gain"] = (
+        np.mean(confidence_gains)
+        if confidence_gains
+        else 0
+    )
     return metrics
 
 # ==============================
@@ -506,7 +569,10 @@ overall = {
     "avg_runtime": df["runtime"].mean(),
     "avg_chunks": df["chunks"].mean(),
     "avg_redecodes": df["redecodes"].mean(),
-    "avg_redecode_ratio": df["redecode_ratio"].mean()
+    "avg_redecode_ratio": df["redecode_ratio"].mean(),
+    "avg_confidence": df["avg_confidence"].mean(),
+    "avg_conf_gain": df["avg_conf_gain"].mean(),
+    "total_conf_improvement": df["avg_conf_gain"].sum()
 }
 
 print("\n📊 Overall Performance:")
@@ -584,6 +650,39 @@ plt.savefig(
         "model_usage.png"
     )
 )
+plt.close()
+# ==============================
+# CONFIDENCE VS COMPUTE
+# ==============================
+
+plt.figure(figsize=(8,5))
+
+plt.scatter(
+    df["runtime"],
+    df["avg_confidence"]
+)
+for i, txt in enumerate(df["file"]):
+    plt.annotate(
+        txt,
+        (
+            df["runtime"].iloc[i],
+            df["avg_confidence"].iloc[i]
+        )
+    )
+plt.xlabel("Runtime (seconds)")
+plt.ylabel("Average Confidence")
+
+plt.title(
+    "Confidence vs Runtime Trade-off"
+)
+
+plt.savefig(
+    os.path.join(
+        RESULTS_FOLDER,
+        "confidence_vs_runtime.png"
+    )
+)
+
 plt.close()
 
 print("\n✅ EVERYTHING COMPLETE")
