@@ -3,7 +3,6 @@ import whisper
 import librosa
 import numpy as np
 import matplotlib.pyplot as plt
-from jiwer import wer, wil, wip
 import torch
 import soundfile as sf
 import time
